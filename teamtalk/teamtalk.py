@@ -15,7 +15,6 @@ import telnetlib
 import warnings
 import functools
 
-
 # constants
 ## MSG Types
 NONE_MSG = 0
@@ -25,9 +24,9 @@ BROADCAST_MSG = 3
 CUSTOM_MSG = 4
 
 ## User Types (from library/teamtalk_lib/teamtalk/common.h)
-USERTYPE_NONE	 = 0x00
+USERTYPE_NONE = 0x00
 USERTYPE_DEFAULT      = 0x01
-USERTYPE_ADMIN	= 0x02
+USERTYPE_ADMIN= 0x02
 
 ## Command Errors
 
@@ -140,7 +139,8 @@ SUBSCRIBE_INTERCEPT_DESKTOP	 = 0x00400000
 # SUBSCRIBE_INTERCEPT_DESKTOPINPUT	  = 0x00800000
 SUBSCRIBE_INTERCEPT_MEDIAFILE = 0x01000000
 SUBSCRIBE_INTERCEPT_ALL = 0x017B0000
-
+#local udp port.
+localUdp= 54321
 
 def split_parts(msg):
 	"""Splits a key=value pair into a tuple."""
@@ -246,19 +246,22 @@ class TeamTalkError(Exception):
 class TeamTalkServer:
 	"""Represents a single TeamTalk server."""
 
-	def __init__(self, host=None, tcpport=10333):
-		self.set_connection_info(host, tcpport)
+	def __init__(self, host=None, tcpport=10333,udpPort=0):
+		self.set_connection_info(host, tcpport,udpPort)
 		self.con = None
 		self.pinger_thread = None
 		self.message_thread = None
 		self.disconnecting = False
 		self.logging_in = False
+		self.getingAccounts=False
 		self.logged_out = False
 		self.current_id = 0
 		self.last_id = 0
 		self.subscriptions = {}
 		self.channels = []
 		self.users = []
+		self.bans=[]
+		self.accounts=[]
 		self.me = {}
 		self.server_params = {}
 		self.files = []
@@ -266,10 +269,12 @@ class TeamTalkServer:
 		self._login_sequence = 0
 
 
-	def set_connection_info(self, host, tcpport=10333):
+	def set_connection_info(self, host, tcpport=10333,udpPort=0):
 		"""Sets the server's host and TCP port"""
 		self.host = host
 		self.tcpport = tcpport
+		if udpPort==0: self.udpPort=tcpport
+		else: self.udpPort=udpPort
 
 	def connect(self):
 		"""Initiates the connection to this server
@@ -373,14 +378,13 @@ class TeamTalkServer:
 				# indicates success or irrelevance
 				if params["number"] == CMD_ERR_IGNORE or params["number"] == CMD_ERR_SUCCESS:
 					continue
-				raise TeamTalkError(params["number"], params["message"])
+				raise RuntimeError(str(params["number"])+": "+params["message"])
 			# Call messages for the event if necessary
 			for func in self.subscriptions.get(event, []):
 				func(self, params)
 			# finally, call the callback
 			if callable(callback):
 				callback(self, event, params)
-
 
 	def _sleep(self, seconds):
 		"""Like time.sleep, but immediately halts execution if we need to disconnect from a server"""
@@ -589,6 +593,61 @@ class TeamTalkServer:
 		msg = build_tt_message("kick", params)
 		self.send(msg)
 
+	def ban(self, target, channel=None, id=None):
+		"""bans the provided user from a channel (if specified) otherwise the server.
+		Target can be anything accepted by get_user
+		Channel can be anything accepted by get_channel"""
+		target = self.get_user(target)
+		target = target.get("userid")
+		params = {"userid": target}
+		if channel:
+			channel = self.get_channel(channel)
+			channel = channel.get("chanid")
+			params["chanid"] = channel
+		if id:
+			params["id"] = id
+		msg = build_tt_message("ban", params)
+		self.send(msg)
+
+	def unban(self, target, channel=None, id=None):
+		"""Unbans the provided user from a channel (if specified) otherwise the server.
+		Target can be an ip address
+		Channel can be anything accepted by get_channel"""
+		target=target
+		params = {"ipaddr": target}
+		if channel:
+			channel = self.get_channel(channel)
+			channel = channel.get("chanid")
+			params["chanid"] = channel
+		if id:
+			params["id"] = id
+		msg = build_tt_message("unban", params)
+		self.send(msg)
+
+	def getBans(self):
+		self.send("listbans id=101")
+		self._sleep(0.2)
+		while self.current_id==101: self._sleep(0.05)
+		return self.bans
+
+	def getAccounts(self):
+		msg=build_tt_message("listaccounts",{"id":10})
+		self.send(msg)
+		self._sleep(0.2)
+		while self.getingAccounts: self._sleep(0.05)
+		return self.accounts
+
+	def newAccount(self,username: str,password: str,usertype: int,userRights=[]):
+		params={"username":username,"password":password,"usertype":usertype}
+		if usertype<2: 
+			params.update({"userrights":USERRIGHT_DEFAULT})
+		msg=build_tt_message("newaccount",params)
+		self.send(msg)
+
+	def deleteAccount(self,username: str):
+		msg=build_tt_message("delaccount",{"username":username})
+		self.send(msg)
+
 	def move(self, user, destination, id=None):
 		"""Moves the provided user to destination.
 		User can be anything accepted by get_user
@@ -737,6 +796,14 @@ class TeamTalkServer:
 		print(f"error ({params['number']}): {params['message']}")
 
 	@staticmethod
+	def _handle_userbanned(self,params):
+		if params not in self.bans: self.bans.append(params)
+
+	@staticmethod
+	def _handle_useraccount(self,params):
+		if params not in self.accounts: self.accounts.append(params)
+
+	@staticmethod
 	def _handle_begin(self, params):
 		"""Event fired to acknowledge the start of an ordered response.
 		When a sent message contains the field "id=*", responses take the form:
@@ -750,6 +817,11 @@ class TeamTalkServer:
 		# Handle these differently
 		if self.current_id == 1:
 			self.logging_in = True
+		if self.current_id==10:
+			self.accounts.clear()
+			self.getingAccounts=True
+		if self.current_id==101	:
+			self.bans.clear()
 
 	@staticmethod
 	def _handle_end(self, params):
@@ -766,6 +838,8 @@ class TeamTalkServer:
 		if params["id"] == 1:
 			self.logging_in = False
 			self._login_sequence = 2
+		if params["id"] == 10:
+			self.getingAccounts=False
 
 	@staticmethod
 	def _handle_loggedin(self, params):
